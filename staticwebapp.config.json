@@ -1,7 +1,7 @@
 {
   "navigationFallback": {
-    "rewrite": "/app/index.html",
-    "exclude": ["/api/*"]
+    "rewrite": "/index.html",
+    "exclude": ["/api/*", "/.auth/*"]
   },
   "routes": [
     {
@@ -13,13 +13,6 @@
     "401": {
       "statusCode": 302,
       "redirect": "/.auth/login/aad"
-    }
-  },
-  "auth": {
-    "identityProviders": {
-      "azureActiveDirectory": {
-        "userDetailsClaim": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name"
-      }
     }
   }
 }

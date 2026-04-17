@@ -9,10 +9,17 @@ import logging
 import requests
 from datetime import datetime, timedelta
 
+from secrets_store import get_secret
+
+# Per-process product cache: productId → {sku, name, vendorName}
+_product_cache: dict = {}
+# Per-process invoice-items cache: (year, month) → list of raw PAX8 invoice items
+_invoice_items_cache: dict = {}
+
 logger = logging.getLogger(__name__)
 
-PAX8_TOKEN_URL = "https://login.pax8.com/oauth/token"
-PAX8_AUDIENCE = "api://p8p.client/pax8.app.api.partner.v1"
+PAX8_TOKEN_URL = "https://api.pax8.com/v1/token"
+PAX8_AUDIENCE = "https://api.pax8.com"
 PAX8_BASE_URL = "https://api.pax8.com/v1"
 
 # In-memory token cache
@@ -31,10 +38,10 @@ class PAX8Error(Exception):
 
 class PAX8Client:
     def __init__(self):
-        self.client_id = os.environ.get("PAX8_CLIENT_ID")
-        self.client_secret = os.environ.get("PAX8_CLIENT_SECRET")
+        self.client_id = get_secret("pax8_client_id")
+        self.client_secret = get_secret("pax8_client_secret")
         if not self.client_id or not self.client_secret:
-            raise PAX8Error("PAX8_CLIENT_ID and PAX8_CLIENT_SECRET must be set")
+            raise PAX8Error("PAX8 client ID and secret must be configured in Iestatījumi")
         self.session = requests.Session()
 
     # ------------------------------------------------------------------
@@ -100,11 +107,32 @@ class PAX8Client:
     # ------------------------------------------------------------------
 
     def list_subscriptions(self, company_id: str, page: int = 0, size: int = 200) -> dict:
-        """GET /companies/{company_id}/subscriptions"""
+        """GET /subscriptions?companyId=X (PAX8 v1 flat endpoint)."""
         return self._get(
-            f"/companies/{company_id}/subscriptions",
-            params={"page": page, "size": size},
+            "/subscriptions",
+            params={"companyId": company_id, "page": page, "size": size},
         )
+
+    # ------------------------------------------------------------------
+    # Products
+    # ------------------------------------------------------------------
+
+    def get_product(self, product_id: str) -> dict:
+        """GET /products/{id}, cached per process."""
+        if product_id in _product_cache:
+            return _product_cache[product_id]
+        try:
+            data = self._get(f"/products/{product_id}")
+            info = {
+                "sku": data.get("sku") or "",
+                "name": data.get("name") or "",
+                "vendorName": data.get("vendorName") or "",
+            }
+        except PAX8Error as e:
+            logger.warning(f"Product lookup failed for {product_id}: {e}")
+            info = {"sku": "", "name": "", "vendorName": ""}
+        _product_cache[product_id] = info
+        return info
 
     # ------------------------------------------------------------------
     # Usage
@@ -183,6 +211,28 @@ class PAX8Client:
         """GET /invoices/{id}"""
         return self._get(f"/invoices/{invoice_id}")
 
+    def get_invoice_items(self, invoice_id: str, page: int = 0, size: int = 200) -> dict:
+        """GET /invoices/{id}/items — paginated invoice line items."""
+        return self._get(
+            f"/invoices/{invoice_id}/items",
+            params={"page": page, "size": size},
+        )
+
+    def get_all_invoice_items(self, invoice_id: str) -> list:
+        """Fetch all items for an invoice, handling pagination."""
+        items = []
+        page = 0
+        size = 200
+        while True:
+            data = self.get_invoice_items(invoice_id, page=page, size=size)
+            chunk = data.get("content", data.get("data", []))
+            items.extend(chunk)
+            total_pages = data.get("page", {}).get("totalPages", 1) if isinstance(data.get("page"), dict) else 1
+            if page + 1 >= total_pages or len(chunk) < size:
+                break
+            page += 1
+        return items
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -218,58 +268,82 @@ class PAX8Client:
             page += 1
         return subscriptions
 
-    def get_billing_for_month(self, company_id: str, year: int, month: int) -> list:
+    def get_invoice_items_for_month(self, year: int, month: int) -> list:
         """
-        Returns billing line items for a company for a given month.
-        Combines subscription data with usage summaries.
+        Fetch every PAX8 invoice item billed for a given month, across all companies.
+
+        PAX8 issues partner invoices on the 1st of each month. We pick any invoice
+        whose invoiceDate falls within the target month and pull all its items.
+
+        Result is cached per (year, month) in-process so repeated per-company calls
+        don't refetch.
         """
+        cache_key = (year, month)
+        if cache_key in _invoice_items_cache:
+            return _invoice_items_cache[cache_key]
+
         from calendar import monthrange
-        start_date = f"{year}-{month:02d}-01"
         last_day = monthrange(year, month)[1]
+        start_date = f"{year}-{month:02d}-01"
         end_date = f"{year}-{month:02d}-{last_day:02d}"
 
+        all_items: list = []
+        try:
+            invoices_resp = self.list_invoices(start_date, end_date, size=50)
+            invoices = invoices_resp.get("content", invoices_resp.get("data", []))
+        except PAX8Error as e:
+            logger.warning(f"Failed to list invoices for {year}-{month:02d}: {e}")
+            return []
+
+        for inv in invoices:
+            invoice_date = inv.get("invoiceDate", "")
+            if not (invoice_date.startswith(f"{year}-{month:02d}")):
+                continue
+            try:
+                items = self.get_all_invoice_items(inv["id"])
+                all_items.extend(items)
+            except PAX8Error as e:
+                logger.warning(f"Failed to fetch items for invoice {inv.get('id')}: {e}")
+
+        _invoice_items_cache[cache_key] = all_items
+        return all_items
+
+    def get_billing_for_month(self, company_id: str, year: int, month: int) -> list:
+        """
+        Returns billing line items for a company for a given month, sourced from
+        the PAX8 partner invoice line items (the authoritative partner cost data).
+
+        Each returned line matches a row on the PAX8 invoice:
+          sku, productName, quantity, cost (unit partner cost), costTotal,
+          term (Monthly/Annual/Usage), startPeriod, endPeriod, type
+          (subscription | prorate | usage | ...), vendorName.
+        """
+        items = self.get_invoice_items_for_month(year, month)
         billing_lines = []
 
-        # Get subscriptions
-        try:
-            subscriptions = self.get_all_subscriptions(company_id)
-            for sub in subscriptions:
-                if sub.get("status") in ("Active", "Cancelled"):
-                    sku = sub.get("sku", sub.get("productId", "UNKNOWN"))
-                    billing_lines.append({
-                        "type": "subscription",
-                        "sku": sku,
-                        "name": sub.get("productName", sub.get("name", sku)),
-                        "quantity": sub.get("quantity", 1),
-                        "unit_cost": float(sub.get("price", sub.get("unitCost", 0))),
-                        "total_cost": float(sub.get("price", sub.get("unitCost", 0)))
-                        * float(sub.get("quantity", 1)),
-                        "billing_term": sub.get("billingTerm", "Monthly"),
-                        "subscription_id": sub.get("id"),
-                        "commitment": sub.get("commitmentTerm", ""),
-                    })
-        except PAX8Error as e:
-            logger.warning(f"Failed to fetch subscriptions for {company_id}: {e}")
+        for item in items:
+            if item.get("companyId") != company_id:
+                continue
 
-        # Get usage summaries
-        try:
-            usage_data = self.get_detailed_usage_summary(
-                company_id, start_date, end_date
-            )
-            usage_items = usage_data.get("content", usage_data.get("data", []))
-            for item in usage_items:
-                sku = item.get("sku", item.get("resourceId", "USAGE"))
-                billing_lines.append({
-                    "type": "usage",
-                    "sku": sku,
-                    "name": item.get("resourceName", item.get("name", sku)),
-                    "quantity": float(item.get("quantity", 0)),
-                    "unit_cost": float(item.get("unitCost", item.get("pricePerUnit", 0))),
-                    "total_cost": float(item.get("totalCost", item.get("cost", 0))),
-                    "billing_term": "Usage",
-                    "resource_group": item.get("resourceGroup", ""),
-                })
-        except PAX8Error as e:
-            logger.warning(f"Failed to fetch usage for {company_id}: {e}")
+            sku = item.get("sku") or item.get("productId") or "UNKNOWN"
+            # costTotal is what PAX8 charges us for this line; fall back to unit * qty.
+            quantity = float(item.get("quantity") or 0)
+            unit_cost = float(item.get("cost") or 0)
+            total_cost = float(item.get("costTotal") or (quantity * unit_cost) or 0)
+
+            billing_lines.append({
+                "type": item.get("type", "subscription"),
+                "sku": sku,
+                "name": item.get("productName") or item.get("description") or sku,
+                "quantity": quantity,
+                "unit_cost": unit_cost,
+                "total_cost": round(total_cost, 4),
+                "billing_term": item.get("term", "Monthly"),
+                "start_period": item.get("startPeriod", ""),
+                "end_period": item.get("endPeriod", ""),
+                "subscription_id": item.get("subscriptionId"),
+                "vendor": item.get("vendorName", ""),
+                "description": item.get("description", ""),
+            })
 
         return billing_lines

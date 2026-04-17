@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "baseName": {
+      "value": "abianinv"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "swaLocation": {
+      "value": "westeurope"
+    },
+    "swaSku": {
+      "value": "Standard"
+    },
+    "repositoryUrl": {
+      "value": "https://github.com/eduardsabianlv/abian-invoice-app"
+    },
+    "branch": {
+      "value": "main"
+    }
+  }
+}

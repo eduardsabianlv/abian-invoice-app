@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+api/.venv/
+api/local.settings.json
+api/secrets.json
+api/manual_links.json
+infra/main.parameters.json
+.claude/
+.DS_Store
+.env

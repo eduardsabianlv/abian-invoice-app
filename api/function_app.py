@@ -21,37 +21,17 @@ from invoice_mapper import (
     get_month_date_range,
     excl_vat,
 )
+import secrets_store
+import manual_links_store
+import mappings_store
 
 logger = logging.getLogger(__name__)
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
-# Path to company mappings config file (relative to function_app.py)
-MAPPINGS_FILE = os.path.join(os.path.dirname(__file__), "company_mappings.json")
 
-
-# ------------------------------------------------------------------
-# Config helpers
-# ------------------------------------------------------------------
-
-def load_mappings() -> dict:
-    """Load company mappings from JSON file."""
-    try:
-        with open(MAPPINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Strip internal comment keys
-        return {k: v for k, v in data.items() if not k.startswith("_")}
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError as e:
-        logger.error(f"company_mappings.json parse error: {e}")
-        return {}
-
-
-def save_mappings(mappings: dict) -> None:
-    """Save company mappings to JSON file."""
-    with open(MAPPINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(mappings, f, ensure_ascii=False, indent=2)
+# Company mappings are served by mappings_store (Azure Tables or JSON fallback).
+load_mappings = mappings_store.load_mappings
 
 
 # ------------------------------------------------------------------
@@ -188,6 +168,7 @@ def get_status(req: func.HttpRequest) -> func.HttpResponse:
         pax8 = PAX8Client()
         moneo = MoneoClient()
         mappings = load_mappings()
+        manual_links = manual_links_store.get_for_period(year, month)
 
         # Fetch all PAX8 companies
         pax8_companies = pax8.get_all_companies()
@@ -228,6 +209,22 @@ def get_status(req: func.HttpRequest) -> func.HttpResponse:
 
             # Moneo invoices for this customer this month
             customer_invoices = moneo_by_customer.get(moneo_code, [])
+
+            # Apply manual link override: user linked an existing Moneo invoice
+            # (often for an invoice in a different month, or a partial amount)
+            link = manual_links.get(pax8_id)
+            manual = False
+            if link and not customer_invoices:
+                manual = True
+                customer_invoices = [{
+                    "invnr": link.get("invoice_nr", ""),
+                    "invdate": link.get("invoice_date", ""),
+                    "total": float(link.get("amount", 0)),
+                    "paid": float(link.get("amount", 0)) if link.get("payment_status") == "paid" else 0.0,
+                    "payment_status": link.get("payment_status", "unpaid"),
+                    "_manual": True,
+                    "_original_total": float(link.get("original_total", link.get("amount", 0))),
+                }]
 
             moneo_total = sum(
                 float(inv.get("total", inv.get("invsum", 0)) or 0)
@@ -270,6 +267,7 @@ def get_status(req: func.HttpRequest) -> func.HttpResponse:
                 "profit_pct": profit_data["profit_pct"],
                 "status": status,
                 "payment_status": payment_status,
+                "manual_linked": manual,
                 "invoices": [
                     {
                         "invnr": inv.get("invnr", inv.get("invoiceNr", "")),
@@ -277,6 +275,8 @@ def get_status(req: func.HttpRequest) -> func.HttpResponse:
                         "total": float(inv.get("total", inv.get("invsum", 0)) or 0),
                         "paid": float(inv.get("paid", inv.get("paidsum", 0)) or 0),
                         "payment_status": inv["payment_status"],
+                        "_original_total": inv.get("_original_total"),
+                        "_manual": inv.get("_manual", False),
                     }
                     for inv in customer_invoices
                 ],
@@ -491,6 +491,154 @@ def generate_invoice(req: func.HttpRequest) -> func.HttpResponse:
 
 
 # ------------------------------------------------------------------
+# POST /api/manual-links
+# ------------------------------------------------------------------
+
+@app.route(route="manual-links", methods=["POST"])
+def save_manual_link(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Link an existing Moneo invoice to a PAX8 company for a given month,
+    optionally overriding the amount (when one invoice spans multiple months).
+
+    Body: { year, month, pax8_id, invoice_nr, invoice_date,
+            amount, original_total, payment_status }
+    """
+    try:
+        body = req.get_json()
+    except Exception:
+        return error_response("Invalid JSON body", 400)
+
+    required = ("year", "month", "pax8_id", "invoice_nr", "amount")
+    missing = [k for k in required if body.get(k) in (None, "")]
+    if missing:
+        return error_response(f"Missing fields: {', '.join(missing)}", 400)
+
+    try:
+        year = int(body["year"])
+        month = int(body["month"])
+        amount = float(body["amount"])
+        original_total = float(body.get("original_total") or body["amount"])
+    except (TypeError, ValueError):
+        return error_response("year, month and amounts must be numeric", 400)
+
+    link = {
+        "invoice_nr": str(body["invoice_nr"]),
+        "invoice_date": body.get("invoice_date", ""),
+        "amount": amount,
+        "original_total": original_total,
+        "payment_status": body.get("payment_status", "unpaid"),
+    }
+    manual_links_store.set_link(year, month, body["pax8_id"], link)
+    return json_response({"saved": True, "link": link})
+
+
+# ------------------------------------------------------------------
+# DELETE /api/manual-links
+# ------------------------------------------------------------------
+
+@app.route(route="manual-links", methods=["DELETE"])
+def delete_manual_link(req: func.HttpRequest) -> func.HttpResponse:
+    """Body: { year, month, pax8_id }"""
+    try:
+        body = req.get_json()
+    except Exception:
+        return error_response("Invalid JSON body", 400)
+
+    for key in ("year", "month", "pax8_id"):
+        if body.get(key) in (None, ""):
+            return error_response(f"Missing field: {key}", 400)
+
+    try:
+        year = int(body["year"])
+        month = int(body["month"])
+    except (TypeError, ValueError):
+        return error_response("year and month must be integers", 400)
+
+    removed = manual_links_store.delete_link(year, month, body["pax8_id"])
+    return json_response({"removed": removed})
+
+
+# ------------------------------------------------------------------
+# GET /api/moneo-customers
+# ------------------------------------------------------------------
+
+@app.route(route="moneo-customers", methods=["GET"])
+def get_moneo_customers(req: func.HttpRequest) -> func.HttpResponse:
+    """Return all Moneo customers (custcode + companyname + vatno) for autocomplete."""
+    try:
+        moneo = MoneoClient()
+        customers = moneo.get_customers()
+        result = [
+            {
+                "custcode": c.get("code") or c.get("custcode") or "",
+                "companyname": c.get("name") or c.get("companyname") or "",
+                "vatno": c.get("vatno") or "",
+            }
+            for c in customers
+            if c.get("code") or c.get("custcode")
+        ]
+        result.sort(key=lambda x: (x["companyname"] or "").lower())
+        return json_response(result)
+    except MoneoError as e:
+        logger.error(f"Moneo error in get_moneo_customers: {e}")
+        return error_response(str(e), e.status_code or 502)
+    except Exception as e:
+        logger.exception("Unexpected error in get_moneo_customers")
+        return error_response(str(e))
+
+
+# ------------------------------------------------------------------
+# GET /api/secrets
+# ------------------------------------------------------------------
+
+@app.route(route="secrets", methods=["GET"])
+def get_secrets(req: func.HttpRequest) -> func.HttpResponse:
+    """Return masked previews of configured API credentials."""
+    try:
+        return json_response(secrets_store.get_masked_all())
+    except Exception as e:
+        logger.exception("Error loading secrets")
+        return error_response(str(e))
+
+
+# ------------------------------------------------------------------
+# POST /api/secrets
+# ------------------------------------------------------------------
+
+@app.route(route="secrets", methods=["POST"])
+def save_secrets(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Update API credentials.
+
+    Body: partial dict, any subset of:
+      pax8_client_id, pax8_client_secret, moneo_api_key, moneo_company_id
+    - Non-empty string → replace
+    - Empty string or omitted key → leave unchanged
+    - null → clear
+    """
+    try:
+        body = req.get_json()
+    except Exception:
+        return error_response("Invalid JSON body", 400)
+
+    if not isinstance(body, dict):
+        return error_response("Body must be a JSON object", 400)
+
+    allowed = set(secrets_store.KEYS)
+    unknown = set(body.keys()) - allowed
+    if unknown:
+        return error_response(f"Unknown keys: {', '.join(sorted(unknown))}", 400)
+
+    try:
+        secrets_store.update_secrets(body)
+        secrets_store.invalidate_caches()
+        return json_response({"saved": True, "secrets": secrets_store.get_masked_all()})
+    except Exception as e:
+        logger.exception("Error saving secrets")
+        return error_response(str(e))
+
+
+# ------------------------------------------------------------------
 # GET /api/config
 # ------------------------------------------------------------------
 
@@ -532,13 +680,8 @@ def save_config(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Body must be a JSON object", 400)
 
     try:
-        # Merge with existing mappings
-        existing = load_mappings()
-        existing.update(body)
-        # Remove entries explicitly set to null
-        existing = {k: v for k, v in existing.items() if v is not None}
-        save_mappings(existing)
-        return json_response({"saved": True, "mappings": existing})
+        mappings = mappings_store.upsert_many(body)
+        return json_response({"saved": True, "mappings": mappings})
     except Exception as e:
         logger.exception("Error saving config")
         return error_response(str(e))

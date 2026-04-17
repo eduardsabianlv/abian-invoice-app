@@ -8,6 +8,8 @@ import logging
 import requests
 from typing import Any, Optional
 
+from secrets_store import get_secret
+
 logger = logging.getLogger(__name__)
 
 MONEO_BASE = "https://api.moneo.lv"
@@ -22,10 +24,10 @@ class MoneoError(Exception):
 
 class MoneoClient:
     def __init__(self):
-        self.api_key = os.environ.get("MONEO_API_KEY")
-        self.company_id = os.environ.get("MONEO_COMPANY_ID")
+        self.api_key = get_secret("moneo_api_key")
+        self.company_id = get_secret("moneo_company_id")
         if not self.api_key or not self.company_id:
-            raise MoneoError("MONEO_API_KEY and MONEO_COMPANY_ID must be set")
+            raise MoneoError("Moneo API key and company ID must be configured in Iestatījumi")
         self.session = requests.Session()
 
     # ------------------------------------------------------------------
@@ -46,7 +48,9 @@ class MoneoClient:
 
     def _post(self, table: str, suffix: str, payload: dict) -> dict:
         url = self._url(table, suffix)
-        resp = self.session.post(url, headers=self._headers(), json=payload, timeout=30)
+        body = dict(payload)
+        body.setdefault("request", {"compuid": self.company_id})
+        resp = self.session.post(url, headers=self._headers(), json=body, timeout=30)
         if not resp.ok:
             raise MoneoError(
                 f"Moneo POST {table}{suffix} failed: {resp.status_code} {resp.text}",
@@ -71,6 +75,7 @@ class MoneoClient:
         """
         POST to table (Moneo query endpoint).
         Returns list of records.
+        Moneo response shape: {"result": {"records": [...]}} — or a plain list / {"data": [...]}.
         """
         payload = {
             "filter": filter or {},
@@ -78,10 +83,13 @@ class MoneoClient:
             "limit": limit,
         }
         result = self._post(table, "/", payload)
-        # Moneo returns {"data": [...]} or a list directly
         if isinstance(result, list):
             return result
-        return result.get("data", result.get("rows", []))
+        if isinstance(result, dict):
+            if isinstance(result.get("result"), dict):
+                return result["result"].get("records") or result["result"].get("data") or []
+            return result.get("data") or result.get("rows") or result.get("records") or []
+        return []
 
     def create(self, table: str, fieldlist: list, data: list) -> dict:
         """
@@ -149,13 +157,13 @@ class MoneoClient:
 
     def get_customers(self, limit: int = 500) -> list:
         """
-        Query contacts.contacts where CustomerFlag=1.
-        Returns all active customers.
+        Query contacts.contacts where customerflag=1.
+        Returns all active customers with their raw Moneo fields.
         """
         return self.query(
             "contacts.contacts",
-            filter={"CustomerFlag": 1},
-            fields=["custcode", "companyname", "email", "vatno", "address"],
+            filter={"customerflag": 1},
+            fields=["code", "name", "email", "vatno"],
             limit=limit,
         )
 
@@ -163,7 +171,7 @@ class MoneoClient:
         """Fetch a single customer by code."""
         results = self.query(
             "contacts.contacts",
-            filter={"custcode": customer_code, "CustomerFlag": 1},
+            filter={"code": customer_code, "customerflag": 1},
             limit=1,
         )
         return results[0] if results else None
@@ -239,25 +247,37 @@ class MoneoClient:
 
     def get_invoice_payment_status(self, invoices: list) -> list:
         """
-        Enrich invoice list with payment status.
-        Moneo invoices have fields like: invnr, invdate, total, paid, custcode, ...
-        Status logic:
-          - paid >= total → 'paid'
-          - paid > 0 and paid < total → 'partial'
-          - paid == 0 → 'unpaid'
-        Returns the same list with 'payment_status' field added.
+        Enrich invoice list with payment status and normalized fields.
+        Moneo sales.invoices fields:
+          sernr (invoice number), invdate, custcode, custname,
+          totsum (incl. VAT), sum (excl. VAT), vatsum, totunpaidsum
+        Adds:
+          payment_status ('paid' | 'unpaid' | 'partial')
+          invnr, total, paid  (normalized aliases for the UI)
         """
         enriched = []
         for inv in invoices:
-            total = float(inv.get("total", inv.get("invsum", 0)) or 0)
-            paid = float(inv.get("paid", inv.get("paidsum", 0)) or 0)
+            total = float(
+                inv.get("totsum")
+                or inv.get("total")
+                or inv.get("invsum")
+                or 0
+            )
+            unpaid = float(inv.get("totunpaidsum") or 0)
+            paid = max(total - unpaid, 0)
             if total <= 0:
                 status = "unpaid"
-            elif paid >= total - 0.01:  # small epsilon for float rounding
+            elif unpaid <= 0.01:
                 status = "paid"
             elif paid > 0:
                 status = "partial"
             else:
                 status = "unpaid"
-            enriched.append({**inv, "payment_status": status})
+            enriched.append({
+                **inv,
+                "invnr": inv.get("sernr") or inv.get("invnr") or "",
+                "total": round(total, 2),
+                "paid": round(paid, 2),
+                "payment_status": status,
+            })
         return enriched

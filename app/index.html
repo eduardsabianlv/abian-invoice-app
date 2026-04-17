@@ -56,6 +56,25 @@ async function apiFetch(path, opts = {}) {
   return json;
 }
 
+// Module-level cache for GET responses — shared across tabs.
+const __apiCache = new Map();
+
+async function apiGetCached(key, path, { force = false } = {}) {
+  if (!force && __apiCache.has(key)) return __apiCache.get(key);
+  const data = await apiFetch(path);
+  __apiCache.set(key, data);
+  return data;
+}
+
+function cacheInvalidate(prefix) {
+  if (prefix == null) { __apiCache.clear(); return; }
+  for (const k of Array.from(__apiCache.keys())) {
+    if (k === prefix || k.startsWith(prefix + ':') || k.startsWith(prefix)) {
+      __apiCache.delete(k);
+    }
+  }
+}
+
 // ── Status badge ─────────────────────────────────────────────────────────────
 
 function StatusBadge({ status }) {
@@ -175,6 +194,144 @@ function BillingDetailRow({ pax8Id, year, month, moneoCode }) {
   );
 }
 
+// ── Inline editable amount ────────────────────────────────────────────────────
+
+function EditableAmount({ value, originalValue, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const [input, setInput] = useState(String(value ?? 0));
+  const inputRef = useRef(null);
+
+  useEffect(() => { setInput(String(value ?? 0)); }, [value]);
+  useEffect(() => { if (editing && inputRef.current) inputRef.current.select(); }, [editing]);
+
+  function commit() {
+    const parsed = parseFloat(input.replace(',', '.'));
+    if (!Number.isFinite(parsed)) { setEditing(false); return; }
+    if (parsed !== Number(value)) onSave(parsed);
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <input
+        ref={inputRef}
+        type="text"
+        value={input}
+        onChange={e => setInput(e.target.value)}
+        onBlur={commit}
+        onKeyDown={e => {
+          if (e.key === 'Enter') commit();
+          if (e.key === 'Escape') { setInput(String(value ?? 0)); setEditing(false); }
+        }}
+        className="w-24 border border-blue-400 rounded px-2 py-0.5 text-sm font-mono text-right focus:outline-none focus:ring-2 focus:ring-blue-400"
+      />
+    );
+  }
+
+  const overridden = originalValue != null && Number(value) !== Number(originalValue);
+
+  return (
+    <button
+      type="button"
+      onClick={() => setEditing(true)}
+      title={overridden ? `Pilna rēķina summa: ${fmtEur(originalValue)}` : 'Labot summu (tikai šai rindai)'}
+      className="font-mono text-sm font-medium text-slate-800 hover:text-blue-700 inline-flex items-center gap-1 cursor-pointer"
+    >
+      <span className={overridden ? 'border-b border-dashed border-amber-400' : 'border-b border-dotted border-slate-300'}>
+        {fmtEur(value)}
+      </span>
+      <span className="text-xs text-slate-400">✎</span>
+    </button>
+  );
+}
+
+// ── Invoice picker (manual link from existing Moneo invoices) ─────────────────
+
+function InvoicePicker({ customerCode, onPick }) {
+  const [invoices, setInvoices] = useState(null);
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    function onDocClick(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  async function load() {
+    if (invoices !== null) return;
+    setLoading(true);
+    try {
+      const data = await apiFetch(`/api/invoices?moneo_customer_code=${customerCode}`);
+      const list = (Array.isArray(data) ? data : [])
+        .slice()
+        .sort((a, b) => String(b.invdate || '').localeCompare(String(a.invdate || '')));
+      setInvoices(list);
+    } catch {
+      setInvoices([]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const q = query.trim().toLowerCase();
+  const list = invoices || [];
+  const filtered = !q
+    ? list.slice(0, 15)
+    : list
+        .filter(i =>
+          String(i.invnr || '').toLowerCase().includes(q) ||
+          String(i.invdate || '').includes(q)
+        )
+        .slice(0, 15);
+
+  return (
+    <div ref={wrapRef} className="relative inline-block">
+      <input
+        type="text"
+        value={query}
+        onChange={e => { setQuery(e.target.value); setOpen(true); }}
+        onFocus={() => { setOpen(true); load(); }}
+        placeholder="Piesaistīt Nr..."
+        className="w-32 border border-slate-300 rounded px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-400"
+      />
+      {open && (
+        <div className="absolute z-20 mt-1 right-0 w-72 max-h-64 overflow-auto bg-white border border-slate-200 rounded-lg shadow-lg">
+          {loading && <div className="px-3 py-2 text-xs text-slate-400 italic flex items-center gap-2"><Spinner small /> Ielādē...</div>}
+          {!loading && filtered.length === 0 && (
+            <div className="px-3 py-2 text-xs text-slate-400 italic">Nav atbilstošu rēķinu</div>
+          )}
+          {!loading && filtered.map(inv => (
+            <div
+              key={inv.invnr}
+              onMouseDown={e => {
+                e.preventDefault();
+                onPick(inv);
+                setOpen(false);
+                setQuery('');
+              }}
+              className="px-3 py-2 hover:bg-blue-50 cursor-pointer border-b border-slate-100 last:border-b-0 text-left"
+            >
+              <div className="flex justify-between gap-2 items-center">
+                <span className="font-mono text-xs font-medium text-blue-700">#{inv.invnr}</span>
+                <span className="text-xs text-slate-500">{inv.invdate}</span>
+              </div>
+              <div className="flex justify-between gap-2 mt-0.5">
+                <span className="text-xs text-slate-700">{fmtEur(inv.total)}</span>
+                <StatusBadge status={inv.payment_status === 'paid' ? 'invoiced_paid' : 'invoiced_unpaid'} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Dashboard tab ─────────────────────────────────────────────────────────────
 
 function DashboardTab() {
@@ -188,12 +345,18 @@ function DashboardTab() {
   const [generating, setGenerating] = useState({});
   const [showToast, toastEl] = useToast();
 
-  const fetchStatus = useCallback(() => {
+  const fetchStatus = useCallback((force = false) => {
+    const key = `status:${year}-${month}`;
+    if (!force && __apiCache.has(key)) {
+      setData(__apiCache.get(key));
+      setError(null);
+      return;
+    }
     setLoading(true);
     setError(null);
     setExpanded({});
     apiFetch(`/api/status?year=${year}&month=${month}`)
-      .then(setData)
+      .then(d => { __apiCache.set(key, d); setData(d); })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
   }, [year, month]);
@@ -218,11 +381,77 @@ function DashboardTab() {
         }),
       });
       showToast(`Rēķins ${res.invoice_nr} veiksmīgi izveidots! Kopsumma: ${fmtEur(res.total)}`, 'success');
-      fetchStatus();
+      cacheInvalidate('status');
+      cacheInvalidate(`invoices:${company.moneo_code}`);
+      fetchStatus(true);
     } catch (e) {
       showToast(`Kļūda: ${e.message}`, 'error');
     } finally {
       setGenerating(prev => ({ ...prev, [key]: false }));
+    }
+  }
+
+  async function handleLinkInvoice(company, inv) {
+    try {
+      await apiFetch('/api/manual-links', {
+        method: 'POST',
+        body: JSON.stringify({
+          year, month,
+          pax8_id: company.pax8_id,
+          invoice_nr: inv.invnr,
+          invoice_date: inv.invdate,
+          amount: Number(inv.total) || 0,
+          original_total: Number(inv.total) || 0,
+          payment_status: inv.payment_status || 'unpaid',
+        }),
+      });
+      showToast(`Piesaistīts rēķins #${inv.invnr}`, 'success');
+      cacheInvalidate('status');
+      fetchStatus(true);
+    } catch (e) {
+      showToast(`Kļūda saglabājot: ${e.message}`, 'error');
+    }
+  }
+
+  async function handleOverrideAmount(company, newAmount) {
+    const amount = Number(newAmount);
+    if (!Number.isFinite(amount) || amount < 0) {
+      showToast('Nederīga summa', 'error');
+      return;
+    }
+    const inv = company.invoices?.[0];
+    if (!inv) return;
+    try {
+      await apiFetch('/api/manual-links', {
+        method: 'POST',
+        body: JSON.stringify({
+          year, month,
+          pax8_id: company.pax8_id,
+          invoice_nr: inv.invnr,
+          invoice_date: inv.invdate,
+          amount,
+          original_total: inv._original_total ?? inv.total,
+          payment_status: inv.payment_status || 'unpaid',
+        }),
+      });
+      cacheInvalidate('status');
+      fetchStatus(true);
+    } catch (e) {
+      showToast(`Kļūda saglabājot: ${e.message}`, 'error');
+    }
+  }
+
+  async function handleUnlinkInvoice(company) {
+    try {
+      await apiFetch('/api/manual-links', {
+        method: 'DELETE',
+        body: JSON.stringify({ year, month, pax8_id: company.pax8_id }),
+      });
+      showToast('Rēķins atsaistīts', 'info');
+      cacheInvalidate('status');
+      fetchStatus(true);
+    } catch (e) {
+      showToast(`Kļūda: ${e.message}`, 'error');
     }
   }
 
@@ -253,7 +482,7 @@ function DashboardTab() {
           {years.map(y => <option key={y} value={y}>{y}</option>)}
         </select>
         <button
-          onClick={fetchStatus}
+          onClick={() => fetchStatus(true)}
           disabled={loading}
           className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-1.5 rounded-lg disabled:opacity-50 transition-colors"
         >
@@ -340,13 +569,31 @@ function DashboardTab() {
                       {fmtEur(company.pax8_cost)}
                     </td>
                     {/* Moneo invoice */}
-                    <td className="px-4 py-3 text-right">
+                    <td className="px-4 py-3 text-right" onClick={e => e.stopPropagation()}>
                       {company.invoices.length > 0 ? (
                         <div>
-                          <div className="font-mono text-sm font-medium text-slate-800">{fmtEur(company.moneo_total)}</div>
+                          {company.manual_linked ? (
+                            <div className="flex items-center justify-end gap-2">
+                              <EditableAmount
+                                value={company.moneo_total}
+                                originalValue={company.invoices[0]?._original_total}
+                                onSave={v => handleOverrideAmount(company, v)}
+                              />
+                              <button
+                                onClick={() => handleUnlinkInvoice(company)}
+                                title="Atsaistīt rēķinu"
+                                className="text-xs text-red-400 hover:text-red-600"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="font-mono text-sm font-medium text-slate-800">{fmtEur(company.moneo_total)}</div>
+                          )}
                           {company.invoices.map(inv => (
                             <div key={inv.invnr} className="text-xs text-slate-400">
                               #{inv.invnr} · {inv.invdate}
+                              {company.manual_linked && <span className="ml-1 text-amber-500">(manuāli)</span>}
                             </div>
                           ))}
                         </div>
@@ -374,14 +621,20 @@ function DashboardTab() {
                     {/* Actions */}
                     <td className="px-4 py-3 text-center" onClick={e => e.stopPropagation()}>
                       {company.status === 'not_invoiced' && company.moneo_code && (
-                        <button
-                          onClick={() => handleGenerate(company)}
-                          disabled={!!generating[company.pax8_id]}
-                          className="flex items-center gap-1.5 mx-auto bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded-lg disabled:opacity-50 transition-colors"
-                        >
-                          {generating[company.pax8_id] ? <Spinner small /> : null}
-                          Ģenerēt rēķinu
-                        </button>
+                        <div className="flex flex-col items-center gap-1.5">
+                          <button
+                            onClick={() => handleGenerate(company)}
+                            disabled={!!generating[company.pax8_id]}
+                            className="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded-lg disabled:opacity-50 transition-colors"
+                          >
+                            {generating[company.pax8_id] ? <Spinner small /> : null}
+                            Ģenerēt rēķinu
+                          </button>
+                          <InvoicePicker
+                            customerCode={company.moneo_code}
+                            onPick={inv => handleLinkInvoice(company, inv)}
+                          />
+                        </div>
                       )}
                       {company.status !== 'not_invoiced' && (
                         <span className="text-xs text-slate-300">—</span>
@@ -431,11 +684,207 @@ function DashboardTab() {
   );
 }
 
+// ── Moneo customer autocomplete ───────────────────────────────────────────────
+
+function MoneoCustomerAutocomplete({ customers, value, onChange, onSelect, placeholder, className }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    function onDocClick(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  const q = (value || '').trim().toLowerCase();
+  const filtered = !q
+    ? customers.slice(0, 20)
+    : customers
+        .filter(c =>
+          (c.companyname || '').toLowerCase().includes(q) ||
+          (c.custcode || '').toLowerCase().includes(q)
+        )
+        .slice(0, 20);
+
+  return (
+    <div ref={wrapRef} className="relative">
+      <input
+        type="text"
+        value={value || ''}
+        onChange={e => { onChange(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        placeholder={placeholder}
+        className={className}
+      />
+      {open && filtered.length > 0 && (
+        <div className="absolute z-20 mt-1 w-72 max-h-64 overflow-auto bg-white border border-slate-200 rounded-lg shadow-lg text-sm">
+          {filtered.map(c => (
+            <div
+              key={c.custcode}
+              onMouseDown={e => {
+                e.preventDefault();
+                onSelect(c);
+                setOpen(false);
+              }}
+              className="px-3 py-2 hover:bg-blue-50 cursor-pointer flex justify-between gap-3 border-b border-slate-100 last:border-b-0"
+            >
+              <span className="text-slate-700 truncate">{c.companyname}</span>
+              <span className="font-mono text-xs text-blue-600 shrink-0">{c.custcode}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── API credentials panel ─────────────────────────────────────────────────────
+
+const SECRET_FIELDS = [
+  { key: 'pax8_client_id',     label: 'PAX8 Client ID',     secret: false, placeholder: 'UUID' },
+  { key: 'pax8_client_secret', label: 'PAX8 Client Secret', secret: true,  placeholder: '••••••••' },
+  { key: 'moneo_api_key',      label: 'Moneo API Key',      secret: true,  placeholder: '••••••••' },
+  { key: 'moneo_company_id',   label: 'Moneo Company ID',   secret: false, placeholder: 'piem. 12345' },
+];
+
+function ApiSettingsPanel() {
+  const [status, setStatus] = useState({});
+  const [values, setValues] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [showToast, toastEl] = useToast();
+
+  const load = useCallback(() => {
+    setLoading(true);
+    apiFetch('/api/secrets')
+      .then(setStatus)
+      .catch(e => showToast(`Kļūda ielādējot: ${e.message}`, 'error'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function handleSave() {
+    const patch = {};
+    for (const f of SECRET_FIELDS) {
+      const v = (values[f.key] || '').trim();
+      if (v) patch[f.key] = v;
+    }
+    if (Object.keys(patch).length === 0) {
+      showToast('Nav jaunu vērtību ko saglabāt', 'info');
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await apiFetch('/api/secrets', {
+        method: 'POST',
+        body: JSON.stringify(patch),
+      });
+      setStatus(res.secrets || {});
+      setValues({});
+      showToast('API atslēgas saglabātas', 'success');
+    } catch (e) {
+      showToast(`Kļūda: ${e.message}`, 'error');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleClear(key) {
+    if (!confirm(`Notīrīt ${key}?`)) return;
+    setSaving(true);
+    try {
+      const res = await apiFetch('/api/secrets', {
+        method: 'POST',
+        body: JSON.stringify({ [key]: null }),
+      });
+      setStatus(res.secrets || {});
+      showToast('Vērtība notīrīta', 'info');
+    } catch (e) {
+      showToast(`Kļūda: ${e.message}`, 'error');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+      {toastEl}
+      <div className="px-5 py-4 border-b border-slate-100">
+        <h2 className="font-semibold text-slate-700">API atslēgas</h2>
+        <p className="text-xs text-slate-400 mt-1">
+          PAX8 un Moneo API konfigurācija. Tukšu lauku atstājot, esošā vērtība netiek mainīta.
+        </p>
+      </div>
+
+      {loading ? (
+        <div className="py-10 flex justify-center"><Spinner /></div>
+      ) : (
+        <div className="p-5 space-y-4">
+          {SECRET_FIELDS.map(f => {
+            const s = status[f.key] || {};
+            return (
+              <div key={f.key} className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-center">
+                <label className="text-sm font-medium text-slate-600">{f.label}</label>
+                <div className="sm:col-span-2 flex items-center gap-2">
+                  <input
+                    type={f.secret ? 'password' : 'text'}
+                    value={values[f.key] || ''}
+                    onChange={e => setValues(v => ({ ...v, [f.key]: e.target.value }))}
+                    placeholder={s.configured ? s.preview : f.placeholder}
+                    autoComplete="off"
+                    className="flex-1 border border-slate-300 rounded-lg px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  />
+                  {s.configured && (
+                    <>
+                      <span className={`text-xs px-2 py-1 rounded ${s.source === 'file' ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-600'}`}>
+                        {s.source === 'file' ? 'Saglabāts' : 'Env'}
+                      </span>
+                      {s.source === 'file' && (
+                        <button
+                          onClick={() => handleClear(f.key)}
+                          disabled={saving}
+                          className="text-red-500 hover:text-red-700 text-xs disabled:opacity-50"
+                        >
+                          Notīrīt
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {!s.configured && (
+                    <span className="text-xs px-2 py-1 rounded bg-amber-100 text-amber-700">
+                      Nav iestatīts
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          <div className="flex justify-end pt-2 border-t border-slate-100">
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-1.5 rounded-lg disabled:opacity-50 transition-colors"
+            >
+              {saving ? <Spinner small /> : null}
+              Saglabāt API atslēgas
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Config tab ────────────────────────────────────────────────────────────────
 
 function ConfigTab() {
   const [pax8Companies, setPax8Companies] = useState([]);
   const [mappings, setMappings] = useState({});
+  const [moneoCustomers, setMoneoCustomers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
@@ -445,12 +894,14 @@ function ConfigTab() {
 
   useEffect(() => {
     Promise.all([
-      apiFetch('/api/companies'),
-      apiFetch('/api/config'),
+      apiGetCached('companies', '/api/companies'),
+      apiGetCached('config', '/api/config'),
+      apiGetCached('moneo-customers', '/api/moneo-customers').catch(() => []),
     ])
-      .then(([companies, cfg]) => {
+      .then(([companies, cfg, customers]) => {
         setPax8Companies(companies);
         setMappings(cfg);
+        setMoneoCustomers(Array.isArray(customers) ? customers : []);
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
@@ -480,6 +931,8 @@ function ConfigTab() {
         body: JSON.stringify(newMapping),
       });
       setMappings(updated.mappings || {});
+      __apiCache.set('config', updated.mappings || {});
+      cacheInvalidate('status');
       setEditRow(null);
       showToast('Kartēšana saglabāta', 'success');
     } catch (e) {
@@ -499,6 +952,8 @@ function ConfigTab() {
         body: JSON.stringify(patch),
       });
       setMappings(updated.mappings || {});
+      __apiCache.set('config', updated.mappings || {});
+      cacheInvalidate('status');
       showToast('Kartēšana dzēsta', 'info');
     } catch (e) {
       showToast(`Kļūda: ${e.message}`, 'error');
@@ -512,6 +967,8 @@ function ConfigTab() {
   return (
     <div className="space-y-5">
       {toastEl}
+
+      <ApiSettingsPanel />
 
       {error && (
         <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-red-700 text-sm">
@@ -558,12 +1015,13 @@ function ConfigTab() {
                         />
                       </td>
                       <td className="px-4 py-2">
-                        <input
-                          type="text"
+                        <MoneoCustomerAutocomplete
+                          customers={moneoCustomers}
                           value={editValues.moneo_name}
-                          onChange={e => setEditValues(v => ({ ...v, moneo_name: e.target.value }))}
-                          placeholder="UZŅĒMUMS SIA"
-                          className="w-48 border border-blue-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+                          onChange={name => setEditValues(v => ({ ...v, moneo_name: name }))}
+                          onSelect={c => setEditValues({ moneo_code: c.custcode, moneo_name: c.companyname })}
+                          placeholder="Sāc rakstīt nosaukumu..."
+                          className="w-56 border border-blue-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
                         />
                       </td>
                       <td className="px-4 py-2 text-center">
@@ -655,11 +1113,11 @@ function InvoicesTab() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    apiFetch('/api/companies')
+    apiGetCached('companies', '/api/companies')
       .then(companies => {
         const mapped = companies.filter(c => c.moneo_code);
         setCustomers(mapped);
-        if (mapped.length > 0) setSelectedCode(mapped[0].moneo_code);
+        if (mapped.length > 0) setSelectedCode(prev => prev || mapped[0].moneo_code);
       })
       .catch(e => setError(e.message))
       .finally(() => setLoadingCustomers(false));
@@ -669,7 +1127,7 @@ function InvoicesTab() {
     if (!selectedCode) return;
     setLoading(true);
     setError(null);
-    apiFetch(`/api/invoices?moneo_customer_code=${selectedCode}`)
+    apiGetCached(`invoices:${selectedCode}`, `/api/invoices?moneo_customer_code=${selectedCode}`)
       .then(setInvoices)
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
