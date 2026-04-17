@@ -1,0 +1,8 @@
+{
+  "_comment": "PAX8 company UUID → Moneo customer mapping. Add entries as needed.",
+  "_example_uuid": {
+    "moneo_code": "1013",
+    "moneo_name": "TOLMETS SIA",
+    "split_subscriptions": {}
+  }
+}

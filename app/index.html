@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="lv">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PAX8 ↔ Moneo</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #f8fafc; }
+    .spinner {
+      border: 3px solid #e2e8f0;
+      border-top-color: #3b82f6;
+      border-radius: 50%;
+      width: 24px;
+      height: 24px;
+      animation: spin 0.7s linear infinite;
+      display: inline-block;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .fade-in { animation: fadeIn 0.2s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    tr.expandable:hover { cursor: pointer; }
+    .detail-row td { background: #f1f5f9; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+const MONTH_NAMES = [
+  '', 'Janvāris', 'Februāris', 'Marts', 'Aprīlis', 'Maijs', 'Jūnijs',
+  'Jūlijs', 'Augusts', 'Septembris', 'Oktobris', 'Novembris', 'Decembris'
+];
+
+function fmt(n, decimals = 2) {
+  if (n == null) return '—';
+  return Number(n).toLocaleString('lv-LV', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+function fmtEur(n) { return fmt(n) + ' €'; }
+
+async function apiFetch(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  const json = await res.json().catch(() => ({ error: 'Invalid response' }));
+  if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
+  return json;
+}
+
+// ── Status badge ─────────────────────────────────────────────────────────────
+
+function StatusBadge({ status }) {
+  const map = {
+    invoiced_paid:   { cls: 'bg-green-100 text-green-800',  label: 'Apmaksāts' },
+    invoiced_unpaid: { cls: 'bg-yellow-100 text-yellow-800', label: 'Nav apmaksāts' },
+    not_invoiced:    { cls: 'bg-red-100 text-red-800',       label: 'Nav rēķina' },
+  };
+  const s = map[status] || { cls: 'bg-gray-100 text-gray-600', label: status || '—' };
+  return (
+    <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${s.cls}`}>
+      {s.label}
+    </span>
+  );
+}
+
+// ── Toast notification ────────────────────────────────────────────────────────
+
+function Toast({ msg, type, onDismiss }) {
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 4000);
+    return () => clearTimeout(t);
+  }, []);
+  const colors = { success: 'bg-green-600', error: 'bg-red-600', info: 'bg-blue-600' };
+  return (
+    <div className={`fixed bottom-4 right-4 z-50 ${colors[type] || colors.info} text-white px-4 py-3 rounded-lg shadow-lg flex items-center gap-3 fade-in`}>
+      <span>{msg}</span>
+      <button onClick={onDismiss} className="opacity-70 hover:opacity-100 text-lg leading-none">&times;</button>
+    </div>
+  );
+}
+
+function useToast() {
+  const [toast, setToast] = useState(null);
+  const show = useCallback((msg, type = 'info') => setToast({ msg, type, id: Date.now() }), []);
+  const dismiss = useCallback(() => setToast(null), []);
+  const el = toast ? <Toast key={toast.id} msg={toast.msg} type={toast.type} onDismiss={dismiss} /> : null;
+  return [show, el];
+}
+
+// ── Spinner ───────────────────────────────────────────────────────────────────
+
+function Spinner({ small }) {
+  return <span className="spinner" style={small ? { width: 16, height: 16, borderWidth: 2 } : {}} />;
+}
+
+// ── Line detail panel ─────────────────────────────────────────────────────────
+
+function BillingDetailRow({ pax8Id, year, month, moneoCode }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    setLoading(true);
+    apiFetch(`/api/billing?pax8_company_id=${pax8Id}&year=${year}&month=${month}`)
+      .then(setData)
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [pax8Id, year, month]);
+
+  if (loading) return (
+    <tr className="detail-row">
+      <td colSpan={7} className="px-6 py-4 text-center"><Spinner /></td>
+    </tr>
+  );
+
+  if (error) return (
+    <tr className="detail-row">
+      <td colSpan={7} className="px-6 py-3 text-red-600 text-sm">Kļūda: {error}</td>
+    </tr>
+  );
+
+  if (!data || !data.lines || data.lines.length === 0) return (
+    <tr className="detail-row">
+      <td colSpan={7} className="px-6 py-3 text-gray-500 text-sm italic">Nav PAX8 datu šajā mēnesī</td>
+    </tr>
+  );
+
+  return (
+    <tr className="detail-row fade-in">
+      <td colSpan={7} className="px-6 pb-4 pt-1">
+        <div className="rounded-lg border border-slate-200 overflow-hidden text-sm">
+          <table className="min-w-full">
+            <thead className="bg-slate-100">
+              <tr>
+                <th className="px-3 py-2 text-left text-xs font-semibold text-slate-500 uppercase">PAX8 SKU</th>
+                <th className="px-3 py-2 text-left text-xs font-semibold text-slate-500 uppercase">Nosaukums</th>
+                <th className="px-3 py-2 text-left text-xs font-semibold text-slate-500 uppercase">Moneo kods</th>
+                <th className="px-3 py-2 text-right text-xs font-semibold text-slate-500 uppercase">Daudzums</th>
+                <th className="px-3 py-2 text-right text-xs font-semibold text-slate-500 uppercase">Vienības cena</th>
+                <th className="px-3 py-2 text-right text-xs font-semibold text-slate-500 uppercase">Kopā (PAX8)</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 bg-white">
+              {data.lines.map((line, i) => (
+                <tr key={i} className="hover:bg-slate-50">
+                  <td className="px-3 py-2 font-mono text-xs text-slate-600">{line.sku || '—'}</td>
+                  <td className="px-3 py-2 text-slate-700 max-w-xs truncate" title={line.name}>{line.name || '—'}</td>
+                  <td className="px-3 py-2 font-mono text-xs text-blue-700">{line.moneo_itemcode || '—'}</td>
+                  <td className="px-3 py-2 text-right text-slate-700">{fmt(line.quantity, 2)}</td>
+                  <td className="px-3 py-2 text-right text-slate-700">{fmtEur(line.unit_cost)}</td>
+                  <td className="px-3 py-2 text-right font-medium text-slate-800">{fmtEur(line.total_cost)}</td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot className="bg-slate-50 border-t border-slate-200">
+              <tr>
+                <td colSpan={5} className="px-3 py-2 text-right text-sm font-semibold text-slate-600">Kopā PAX8:</td>
+                <td className="px-3 py-2 text-right text-sm font-bold text-slate-800">{fmtEur(data.total_cost)}</td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+// ── Dashboard tab ─────────────────────────────────────────────────────────────
+
+function DashboardTab() {
+  const today = new Date();
+  const [year, setYear] = useState(today.getFullYear());
+  const [month, setMonth] = useState(today.getMonth() + 1);
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [expanded, setExpanded] = useState({});
+  const [generating, setGenerating] = useState({});
+  const [showToast, toastEl] = useToast();
+
+  const fetchStatus = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    setExpanded({});
+    apiFetch(`/api/status?year=${year}&month=${month}`)
+      .then(setData)
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [year, month]);
+
+  useEffect(() => { fetchStatus(); }, [fetchStatus]);
+
+  function toggleExpand(id) {
+    setExpanded(prev => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  async function handleGenerate(company) {
+    const key = company.pax8_id;
+    setGenerating(prev => ({ ...prev, [key]: true }));
+    try {
+      const res = await apiFetch('/api/generate-invoice', {
+        method: 'POST',
+        body: JSON.stringify({
+          pax8_company_id: company.pax8_id,
+          moneo_customer_code: company.moneo_code,
+          year,
+          month,
+        }),
+      });
+      showToast(`Rēķins ${res.invoice_nr} veiksmīgi izveidots! Kopsumma: ${fmtEur(res.total)}`, 'success');
+      fetchStatus();
+    } catch (e) {
+      showToast(`Kļūda: ${e.message}`, 'error');
+    } finally {
+      setGenerating(prev => ({ ...prev, [key]: false }));
+    }
+  }
+
+  const years = [];
+  for (let y = today.getFullYear() - 2; y <= today.getFullYear() + 1; y++) years.push(y);
+
+  return (
+    <div className="space-y-5">
+      {toastEl}
+
+      {/* Month/year selector */}
+      <div className="flex flex-wrap items-center gap-3 bg-white border border-slate-200 rounded-xl p-4 shadow-sm">
+        <label className="text-sm font-medium text-slate-600">Periods:</label>
+        <select
+          value={month}
+          onChange={e => setMonth(Number(e.target.value))}
+          className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          {MONTH_NAMES.slice(1).map((name, i) => (
+            <option key={i+1} value={i+1}>{name}</option>
+          ))}
+        </select>
+        <select
+          value={year}
+          onChange={e => setYear(Number(e.target.value))}
+          className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          {years.map(y => <option key={y} value={y}>{y}</option>)}
+        </select>
+        <button
+          onClick={fetchStatus}
+          disabled={loading}
+          className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium px-4 py-1.5 rounded-lg disabled:opacity-50 transition-colors"
+        >
+          {loading ? <Spinner small /> : null}
+          Atjaunot
+        </button>
+
+        {data?.summary && (
+          <div className="ml-auto flex gap-6 text-sm">
+            <div className="text-center">
+              <div className="text-xs text-slate-500">Nav rēķina</div>
+              <div className="font-bold text-red-600">{data.summary.not_invoiced_count}</div>
+            </div>
+            <div className="text-center">
+              <div className="text-xs text-slate-500">Nav apmaksāts</div>
+              <div className="font-bold text-yellow-600">{data.summary.unpaid_count}</div>
+            </div>
+            <div className="text-center">
+              <div className="text-xs text-slate-500">Apmaksāts</div>
+              <div className="font-bold text-green-600">{data.summary.paid_count}</div>
+            </div>
+            <div className="text-center">
+              <div className="text-xs text-slate-500">Peļņa</div>
+              <div className={`font-bold ${data.summary.total_profit >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                {fmtEur(data.summary.total_profit)}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Error state */}
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-red-700 text-sm">
+          <strong>Kļūda:</strong> {error}
+        </div>
+      )}
+
+      {/* Loading placeholder */}
+      {loading && !data && (
+        <div className="flex justify-center py-20"><Spinner /></div>
+      )}
+
+      {/* Main table */}
+      {data && (
+        <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+          <table className="min-w-full divide-y divide-slate-200">
+            <thead className="bg-slate-50">
+              <tr>
+                <th className="w-8"></th>
+                <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">Uzņēmums</th>
+                <th className="px-4 py-3 text-right text-xs font-semibold text-slate-500 uppercase tracking-wider">PAX8 izmaksas</th>
+                <th className="px-4 py-3 text-right text-xs font-semibold text-slate-500 uppercase tracking-wider">Moneo rēķins</th>
+                <th className="px-4 py-3 text-right text-xs font-semibold text-slate-500 uppercase tracking-wider">Peļņa</th>
+                <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500 uppercase tracking-wider">Statuss</th>
+                <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500 uppercase tracking-wider">Darbības</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {data.companies.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-10 text-center text-slate-400 italic">
+                    Nav konfigurētu uzņēmumu. Dodieties uz "Iestatījumi".
+                  </td>
+                </tr>
+              )}
+              {data.companies.map(company => (
+                <React.Fragment key={company.pax8_id}>
+                  <tr
+                    className="expandable hover:bg-slate-50 transition-colors"
+                    onClick={() => toggleExpand(company.pax8_id)}
+                  >
+                    {/* Expand toggle */}
+                    <td className="pl-4 text-slate-400 text-lg select-none">
+                      {expanded[company.pax8_id] ? '▾' : '▸'}
+                    </td>
+                    {/* Company */}
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-slate-800">{company.moneo_name || company.pax8_name}</div>
+                      <div className="text-xs text-slate-400 font-mono">{company.moneo_code} · {company.pax8_name}</div>
+                    </td>
+                    {/* PAX8 cost */}
+                    <td className="px-4 py-3 text-right font-mono text-sm text-slate-700">
+                      {fmtEur(company.pax8_cost)}
+                    </td>
+                    {/* Moneo invoice */}
+                    <td className="px-4 py-3 text-right">
+                      {company.invoices.length > 0 ? (
+                        <div>
+                          <div className="font-mono text-sm font-medium text-slate-800">{fmtEur(company.moneo_total)}</div>
+                          {company.invoices.map(inv => (
+                            <div key={inv.invnr} className="text-xs text-slate-400">
+                              #{inv.invnr} · {inv.invdate}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <span className="text-slate-300 text-sm italic">—</span>
+                      )}
+                    </td>
+                    {/* Profit */}
+                    <td className="px-4 py-3 text-right">
+                      {company.moneo_total > 0 ? (
+                        <div>
+                          <div className={`font-mono text-sm font-semibold ${company.profit >= 0 ? 'text-green-700' : 'text-red-600'}`}>
+                            {fmtEur(company.profit)}
+                          </div>
+                          <div className="text-xs text-slate-400">{fmt(company.profit_pct, 1)}%</div>
+                        </div>
+                      ) : (
+                        <span className="text-slate-300 text-sm italic">—</span>
+                      )}
+                    </td>
+                    {/* Status */}
+                    <td className="px-4 py-3 text-center" onClick={e => e.stopPropagation()}>
+                      <StatusBadge status={company.status} />
+                    </td>
+                    {/* Actions */}
+                    <td className="px-4 py-3 text-center" onClick={e => e.stopPropagation()}>
+                      {company.status === 'not_invoiced' && company.moneo_code && (
+                        <button
+                          onClick={() => handleGenerate(company)}
+                          disabled={!!generating[company.pax8_id]}
+                          className="flex items-center gap-1.5 mx-auto bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium px-3 py-1.5 rounded-lg disabled:opacity-50 transition-colors"
+                        >
+                          {generating[company.pax8_id] ? <Spinner small /> : null}
+                          Ģenerēt rēķinu
+                        </button>
+                      )}
+                      {company.status !== 'not_invoiced' && (
+                        <span className="text-xs text-slate-300">—</span>
+                      )}
+                      {company.status === 'not_invoiced' && !company.moneo_code && (
+                        <span className="text-xs text-amber-500 italic">Nav kartēts</span>
+                      )}
+                    </td>
+                  </tr>
+                  {/* Expanded detail */}
+                  {expanded[company.pax8_id] && (
+                    <BillingDetailRow
+                      pax8Id={company.pax8_id}
+                      year={year}
+                      month={month}
+                      moneoCode={company.moneo_code}
+                    />
+                  )}
+                </React.Fragment>
+              ))}
+            </tbody>
+
+            {/* Summary footer */}
+            {data.companies.length > 0 && data.summary && (
+              <tfoot className="bg-slate-50 border-t-2 border-slate-200">
+                <tr>
+                  <td colSpan={2} className="px-4 py-3 text-sm font-semibold text-slate-600">
+                    Kopā ({data.companies.length} uzņēmumi)
+                  </td>
+                  <td className="px-4 py-3 text-right font-mono text-sm font-bold text-slate-800">
+                    {fmtEur(data.summary.total_pax8_cost)}
+                  </td>
+                  <td className="px-4 py-3 text-right font-mono text-sm font-bold text-slate-800">
+                    {fmtEur(data.summary.total_moneo)}
+                  </td>
+                  <td className="px-4 py-3 text-right font-mono text-sm font-bold text-green-700">
+                    {fmtEur(data.summary.total_profit)}
+                  </td>
+                  <td colSpan={2}></td>
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Config tab ────────────────────────────────────────────────────────────────
+
+function ConfigTab() {
+  const [pax8Companies, setPax8Companies] = useState([]);
+  const [mappings, setMappings] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const [showToast, toastEl] = useToast();
+  const [editRow, setEditRow] = useState(null); // pax8_id being edited
+  const [editValues, setEditValues] = useState({ moneo_code: '', moneo_name: '' });
+
+  useEffect(() => {
+    Promise.all([
+      apiFetch('/api/companies'),
+      apiFetch('/api/config'),
+    ])
+      .then(([companies, cfg]) => {
+        setPax8Companies(companies);
+        setMappings(cfg);
+      })
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }, []);
+
+  function startEdit(company) {
+    const m = mappings[company.pax8_id] || {};
+    setEditRow(company.pax8_id);
+    setEditValues({
+      moneo_code: m.moneo_code || '',
+      moneo_name: m.moneo_name || company.moneo_name || '',
+    });
+  }
+
+  async function saveEdit(pax8Id) {
+    setSaving(true);
+    try {
+      const newMapping = {
+        [pax8Id]: {
+          moneo_code: editValues.moneo_code.trim(),
+          moneo_name: editValues.moneo_name.trim(),
+          split_subscriptions: mappings[pax8Id]?.split_subscriptions || {},
+        },
+      };
+      const updated = await apiFetch('/api/config', {
+        method: 'POST',
+        body: JSON.stringify(newMapping),
+      });
+      setMappings(updated.mappings || {});
+      setEditRow(null);
+      showToast('Kartēšana saglabāta', 'success');
+    } catch (e) {
+      showToast(`Kļūda: ${e.message}`, 'error');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteMapping(pax8Id) {
+    if (!confirm('Dzēst šo kartēšanu?')) return;
+    setSaving(true);
+    try {
+      const patch = { [pax8Id]: null };
+      const updated = await apiFetch('/api/config', {
+        method: 'POST',
+        body: JSON.stringify(patch),
+      });
+      setMappings(updated.mappings || {});
+      showToast('Kartēšana dzēsta', 'info');
+    } catch (e) {
+      showToast(`Kļūda: ${e.message}`, 'error');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loading) return <div className="flex justify-center py-20"><Spinner /></div>;
+
+  return (
+    <div className="space-y-5">
+      {toastEl}
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-red-700 text-sm">
+          <strong>Kļūda:</strong> {error}
+        </div>
+      )}
+
+      <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <div className="px-5 py-4 border-b border-slate-100">
+          <h2 className="font-semibold text-slate-700">PAX8 → Moneo uzņēmumu kartēšana</h2>
+          <p className="text-xs text-slate-400 mt-1">
+            Norādiet katram PAX8 uzņēmumam atbilstošo Moneo klienta kodu.
+          </p>
+        </div>
+        <table className="min-w-full divide-y divide-slate-100">
+          <thead className="bg-slate-50">
+            <tr>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase">PAX8 uzņēmums</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase">PAX8 ID</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase">Moneo kods</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase">Moneo nosaukums</th>
+              <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500 uppercase">Darbības</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {pax8Companies.map(company => {
+              const m = mappings[company.pax8_id] || {};
+              const isEditing = editRow === company.pax8_id;
+              return (
+                <tr key={company.pax8_id} className={isEditing ? 'bg-blue-50' : 'hover:bg-slate-50'}>
+                  <td className="px-4 py-3 text-sm font-medium text-slate-800">{company.pax8_name}</td>
+                  <td className="px-4 py-3 text-xs font-mono text-slate-400 max-w-xs truncate" title={company.pax8_id}>
+                    {company.pax8_id}
+                  </td>
+                  {isEditing ? (
+                    <>
+                      <td className="px-4 py-2">
+                        <input
+                          type="text"
+                          value={editValues.moneo_code}
+                          onChange={e => setEditValues(v => ({ ...v, moneo_code: e.target.value }))}
+                          placeholder="1013"
+                          className="w-24 border border-blue-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+                        />
+                      </td>
+                      <td className="px-4 py-2">
+                        <input
+                          type="text"
+                          value={editValues.moneo_name}
+                          onChange={e => setEditValues(v => ({ ...v, moneo_name: e.target.value }))}
+                          placeholder="UZŅĒMUMS SIA"
+                          className="w-48 border border-blue-300 rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+                        />
+                      </td>
+                      <td className="px-4 py-2 text-center">
+                        <div className="flex items-center justify-center gap-2">
+                          <button
+                            onClick={() => saveEdit(company.pax8_id)}
+                            disabled={saving}
+                            className="bg-green-600 hover:bg-green-700 text-white text-xs font-medium px-3 py-1 rounded transition-colors disabled:opacity-50"
+                          >
+                            {saving ? <Spinner small /> : 'Saglabāt'}
+                          </button>
+                          <button
+                            onClick={() => setEditRow(null)}
+                            className="text-slate-500 hover:text-slate-800 text-xs px-2 py-1"
+                          >
+                            Atcelt
+                          </button>
+                        </div>
+                      </td>
+                    </>
+                  ) : (
+                    <>
+                      <td className="px-4 py-3 text-sm">
+                        {m.moneo_code ? (
+                          <span className="font-mono font-medium text-blue-700">{m.moneo_code}</span>
+                        ) : (
+                          <span className="text-slate-300 italic text-xs">Nav</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-sm text-slate-700">
+                        {m.moneo_name || <span className="text-slate-300 italic text-xs">—</span>}
+                      </td>
+                      <td className="px-4 py-3 text-center">
+                        <div className="flex items-center justify-center gap-2">
+                          <button
+                            onClick={() => startEdit(company)}
+                            className="text-blue-600 hover:text-blue-800 text-xs font-medium underline"
+                          >
+                            Rediģēt
+                          </button>
+                          {m.moneo_code && (
+                            <button
+                              onClick={() => deleteMapping(company.pax8_id)}
+                              className="text-red-500 hover:text-red-700 text-xs"
+                            >
+                              Dzēst
+                            </button>
+                          )}
+                        </div>
+                      </td>
+                    </>
+                  )}
+                </tr>
+              );
+            })}
+            {pax8Companies.length === 0 && (
+              <tr>
+                <td colSpan={5} className="px-4 py-8 text-center text-slate-400 italic text-sm">
+                  Nav PAX8 uzņēmumu. Pārbaudiet PAX8 API konfigurāciju.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Info box */}
+      <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-blue-800 text-sm space-y-1">
+        <div className="font-semibold">Kā darbojas kartēšana</div>
+        <ul className="list-disc list-inside space-y-0.5 text-blue-700">
+          <li>Katram PAX8 uzņēmumam norādiet Moneo klienta kodu (piem., 1013)</li>
+          <li>SKU kodi Moneo rēķinos: PAX8 SKU + "<strong>-M</strong>" (mēneša) vai "<strong>-Y</strong>" (gada)</li>
+          <li>Rēķinos izmanto PAX8 SKU kodus — nevis Moneo iekšējos kodus</li>
+          <li>PVN 21% tiek aprēķināts automātiski peļņas kalkulācijā</li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// ── Invoices tab ──────────────────────────────────────────────────────────────
+
+function InvoicesTab() {
+  const [customers, setCustomers] = useState([]);
+  const [selectedCode, setSelectedCode] = useState('');
+  const [invoices, setInvoices] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loadingCustomers, setLoadingCustomers] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    apiFetch('/api/companies')
+      .then(companies => {
+        const mapped = companies.filter(c => c.moneo_code);
+        setCustomers(mapped);
+        if (mapped.length > 0) setSelectedCode(mapped[0].moneo_code);
+      })
+      .catch(e => setError(e.message))
+      .finally(() => setLoadingCustomers(false));
+  }, []);
+
+  useEffect(() => {
+    if (!selectedCode) return;
+    setLoading(true);
+    setError(null);
+    apiFetch(`/api/invoices?moneo_customer_code=${selectedCode}`)
+      .then(setInvoices)
+      .catch(e => setError(e.message))
+      .finally(() => setLoading(false));
+  }, [selectedCode]);
+
+  return (
+    <div className="space-y-5">
+      <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-sm flex items-center gap-4">
+        <label className="text-sm font-medium text-slate-600">Klients:</label>
+        {loadingCustomers ? <Spinner small /> : (
+          <select
+            value={selectedCode}
+            onChange={e => setSelectedCode(e.target.value)}
+            className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+          >
+            {customers.map(c => (
+              <option key={c.pax8_id} value={c.moneo_code}>
+                {c.moneo_name || c.pax8_name} ({c.moneo_code})
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-red-700 text-sm">
+          <strong>Kļūda:</strong> {error}
+        </div>
+      )}
+
+      <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+        <table className="min-w-full divide-y divide-slate-100">
+          <thead className="bg-slate-50">
+            <tr>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase">Rēķins #</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase">Datums</th>
+              <th className="px-4 py-3 text-right text-xs font-semibold text-slate-500 uppercase">Summa</th>
+              <th className="px-4 py-3 text-right text-xs font-semibold text-slate-500 uppercase">Apmaksāts</th>
+              <th className="px-4 py-3 text-center text-xs font-semibold text-slate-500 uppercase">Statuss</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {loading && (
+              <tr><td colSpan={5} className="py-10 text-center"><Spinner /></td></tr>
+            )}
+            {!loading && invoices.length === 0 && (
+              <tr>
+                <td colSpan={5} className="py-8 text-center text-slate-400 italic text-sm">
+                  Nav rēķinu šim klientam
+                </td>
+              </tr>
+            )}
+            {!loading && invoices.map((inv, i) => (
+              <tr key={i} className="hover:bg-slate-50">
+                <td className="px-4 py-3 font-mono text-sm font-medium text-blue-700">
+                  #{inv.invnr || inv.invoiceNr || '—'}
+                </td>
+                <td className="px-4 py-3 text-sm text-slate-700">{inv.invdate || inv.invoiceDate || '—'}</td>
+                <td className="px-4 py-3 text-right font-mono text-sm font-medium text-slate-800">
+                  {fmtEur(inv.total || inv.invsum)}
+                </td>
+                <td className="px-4 py-3 text-right font-mono text-sm text-slate-600">
+                  {fmtEur(inv.paid || inv.paidsum || 0)}
+                </td>
+                <td className="px-4 py-3 text-center">
+                  <StatusBadge status={
+                    inv.payment_status === 'paid' ? 'invoiced_paid' :
+                    inv.payment_status === 'unpaid' ? 'invoiced_unpaid' : 'invoiced_unpaid'
+                  } />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── App shell ─────────────────────────────────────────────────────────────────
+
+const TABS = [
+  { id: 'dashboard', label: 'Pārskats' },
+  { id: 'invoices',  label: 'Rēķini' },
+  { id: 'config',    label: 'Iestatījumi' },
+];
+
+function App() {
+  const [tab, setTab] = useState('dashboard');
+
+  return (
+    <div className="min-h-screen bg-slate-100">
+      {/* Header */}
+      <header className="bg-white border-b border-slate-200 shadow-sm sticky top-0 z-40">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 flex items-center justify-between h-14">
+          <div className="flex items-center gap-3">
+            <div className="bg-blue-600 text-white text-xs font-bold px-2 py-1 rounded">PAX8</div>
+            <span className="text-slate-400 font-light">↔</span>
+            <div className="bg-indigo-600 text-white text-xs font-bold px-2 py-1 rounded">MONEO</div>
+            <span className="text-slate-600 font-semibold ml-2 hidden sm:inline">Microsoft pakalpojumu rēķinošana</span>
+          </div>
+          <nav className="flex gap-1">
+            {TABS.map(t => (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                  tab === t.id
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-600 hover:bg-slate-100'
+                }`}
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
+        </div>
+      </header>
+
+      {/* Main content */}
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+        {tab === 'dashboard' && <DashboardTab />}
+        {tab === 'invoices'  && <InvoicesTab />}
+        {tab === 'config'    && <ConfigTab />}
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
